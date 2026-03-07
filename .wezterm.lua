@@ -329,17 +329,27 @@ config.keys = {
   }},
 }
 
--- 마우스 중간 버튼(휠 클릭)으로 패널 닫기
+-- 우클릭 메뉴: 패널 닫기
 config.mouse_bindings = {
   {
-    event = { Up = { streak = 1, button = 'Middle' } },
+    event = { Up = { streak = 1, button = 'Right' } },
     mods = 'NONE',
     action = wezterm.action_callback(function(window, pane)
       local tab = window:active_tab()
       local panes = tab:panes_with_info()
       if #panes > 1 then
-        window:perform_action(act.CloseCurrentPane { confirm = false }, pane)
-        equalize_tab(window)
+        window:perform_action(act.InputSelector {
+          title = '패널 메뉴',
+          choices = {
+            { label = '현재 패널 닫기' },
+          },
+          action = wezterm.action_callback(function(window2, pane2, id, label)
+            if label == '현재 패널 닫기' then
+              window2:perform_action(act.CloseCurrentPane { confirm = false }, pane2)
+              equalize_tab(window2)
+            end
+          end),
+        }, pane)
       end
     end),
   },
