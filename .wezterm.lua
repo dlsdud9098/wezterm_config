@@ -120,6 +120,7 @@ config.window_background_opacity = 0.95
 config.window_padding = { left = 12, right = 12, top = 12, bottom = 12 }
 config.hide_tab_bar_if_only_one_tab = false
 config.use_fancy_tab_bar = true
+config.tab_max_width = 12
 config.window_decorations = 'INTEGRATED_BUTTONS|RESIZE'
 config.window_frame = {
   font = wezterm.font('Ubuntu Sans', { weight = 'Bold' }),
@@ -242,42 +243,48 @@ local function equalize_tab(window)
   for _, pi in ipairs(initial_panes) do
     if pi.is_active then active_idx = pi.index end
   end
-  for _ = 1, #initial_panes - 1 do
+  -- 더 많이 반복하고 한 번 실패해도 다른 노드 계속 시도 (right-first DFS)
+  for _ = 1, (#initial_panes) * 3 do
     local ps = tab:panes_with_info()
     local tree = build_tree(ps)
-    local queue = { tree }
-    local adjusted = false
-    while #queue > 0 and not adjusted do
-      local node = table.remove(queue, 1)
+    local stack = { tree }
+    local any_adjusted = false
+    while #stack > 0 do
+      local node = table.remove(stack)  -- DFS
+      local local_adjusted = false
       if node.type == 'vsplit' then
         local lc, rc = node.left_child, node.right_child
         local ln, rn = count_cols(lc), count_cols(rc)
         local target_l = math.floor((lc.width + rc.width) * ln / (ln + rn))
         local delta = target_l - lc.width
-        if delta ~= 0 then
+        if math.abs(delta) >= 1 then
           local cands = {}
           local rv, lv = far_pane(rc), far_pane(lc)
+          -- 가장 오른쪽 끝 pane을 우선 후보로 (사용자 경험상 끝쪽이 잘 됨)
+          for _, p in ipairs(collect_panes(rc)) do table.insert(cands, 1, { index = p.index, side = 'right', verify = lv.index }) end
           for _, p in ipairs(collect_panes(lc)) do table.insert(cands, { index = p.index, side = 'left', verify = rv.index }) end
-          for _, p in ipairs(collect_panes(rc)) do table.insert(cands, { index = p.index, side = 'right', verify = lv.index }) end
-          adjusted = try_adjust(window, tab, cands, delta, 'Right', 'Left', 'width')
+          local_adjusted = try_adjust(window, tab, cands, delta, 'Right', 'Left', 'width')
+          any_adjusted = any_adjusted or local_adjusted
         end
-        if not adjusted then table.insert(queue, lc); table.insert(queue, rc) end
+        -- 자식 노드도 항상 push (실패해도 계속)
+        table.insert(stack, lc); table.insert(stack, rc)
       elseif node.type == 'hsplit' then
         local tc, bc = node.top_child, node.bot_child
         local tn, bn = count_rows(tc), count_rows(bc)
         local target_t = math.floor((tc.height + bc.height) * tn / (tn + bn))
         local delta = target_t - tc.height
-        if delta ~= 0 then
+        if math.abs(delta) >= 1 then
           local cands = {}
           local bv, tv = far_pane(bc), far_pane(tc)
+          for _, p in ipairs(collect_panes(bc)) do table.insert(cands, 1, { index = p.index, side = 'right', verify = tv.index }) end
           for _, p in ipairs(collect_panes(tc)) do table.insert(cands, { index = p.index, side = 'left', verify = bv.index }) end
-          for _, p in ipairs(collect_panes(bc)) do table.insert(cands, { index = p.index, side = 'right', verify = tv.index }) end
-          adjusted = try_adjust(window, tab, cands, delta, 'Down', 'Up', 'height')
+          local_adjusted = try_adjust(window, tab, cands, delta, 'Down', 'Up', 'height')
+          any_adjusted = any_adjusted or local_adjusted
         end
-        if not adjusted then table.insert(queue, tc); table.insert(queue, bc) end
+        table.insert(stack, tc); table.insert(stack, bc)
       end
     end
-    if not adjusted then break end
+    if not any_adjusted then break end  -- 수렴
   end
   window:perform_action(act.ActivatePaneByIndex(active_idx), tab:active_pane())
 end
@@ -285,7 +292,8 @@ end
 local function split_and_equalize(direction)
   return wezterm.action_callback(function(window, pane)
     window:perform_action(act.SplitPane { direction = direction }, pane)
-    equalize_tab(window)
+    -- 분할 직후 여러 번 호출하여 수렴 보장
+    for _ = 1, 3 do equalize_tab(window) end
   end)
 end
 
@@ -329,30 +337,101 @@ config.keys = {
   }},
 }
 
--- 우클릭 메뉴: 패널 닫기
-config.mouse_bindings = {
-  {
-    event = { Up = { streak = 1, button = 'Right' } },
-    mods = 'NONE',
-    action = wezterm.action_callback(function(window, pane)
-      local tab = window:active_tab()
-      local panes = tab:panes_with_info()
-      if #panes > 1 then
-        window:perform_action(act.InputSelector {
-          title = '패널 메뉴',
-          choices = {
-            { label = '현재 패널 닫기' },
-          },
-          action = wezterm.action_callback(function(window2, pane2, id, label)
-            if label == '현재 패널 닫기' then
-              window2:perform_action(act.CloseCurrentPane { confirm = false }, pane2)
-              equalize_tab(window2)
-            end
-          end),
-        }, pane)
-      end
-    end),
-  },
+-- Truncate tab titles (fancy tab bar ignores tab_max_width).
+local TAB_TITLE_MAX = 12
+
+wezterm.on('format-tab-title', function(tab, _tabs, _panes, _config, _hover, _max_width)
+  local title = tab.tab_title
+  if title == nil or title == '' then
+    title = tab.active_pane.title or ''
+  end
+  -- UTF-8-aware length via wezterm helper if available; fallback to byte trunc
+  local visible = wezterm.truncate_right and wezterm.truncate_right(title, TAB_TITLE_MAX)
+    or title:sub(1, TAB_TITLE_MAX)
+  if visible ~= title then
+    visible = visible .. '…'
+  end
+  return ' ' .. visible .. ' '
+end)
+
+-- Agent usage in tab bar right-status (claude + codex, ANSI-colored).
+local AGENT_USAGE_BIN = wezterm.home_dir .. '/.cargo/bin/agent-usage'
+local agent_usage_cache = { text = '', ts = 0 }
+local AGENT_USAGE_REFRESH_SEC = 10
+
+local ANSI256 = {
+  [114] = '#87d787',
+  [221] = '#ffd75f',
+  [245] = '#8a8a8a',
 }
+
+local function parse_ansi_segments(s)
+  local segs = {}
+  local cur_fg = nil
+  local i = 1
+  while i <= #s do
+    local esc_start, esc_end = s:find('\27%[[%d;]*m', i)
+    if not esc_start then
+      table.insert(segs, { fg = cur_fg, text = s:sub(i) })
+      break
+    end
+    if esc_start > i then
+      table.insert(segs, { fg = cur_fg, text = s:sub(i, esc_start - 1) })
+    end
+    local code = s:sub(esc_start + 2, esc_end - 1)
+    if code == '0' or code == '' then
+      cur_fg = nil
+    else
+      local r, g, b = code:match('^38;2;(%d+);(%d+);(%d+)$')
+      if r then
+        cur_fg = string.format('#%02x%02x%02x', tonumber(r), tonumber(g), tonumber(b))
+      else
+        local n = code:match('^38;5;(%d+)$')
+        if n then cur_fg = ANSI256[tonumber(n)] or '#cccccc' end
+      end
+    end
+    i = esc_end + 1
+  end
+  return segs
+end
+
+local function run_agent_usage(provider)
+  local ok, stdout = wezterm.run_child_process({ AGENT_USAGE_BIN, provider })
+  if not ok then return '' end
+  return stdout or ''
+end
+
+local function build_status()
+  local raw = run_agent_usage('claude') .. '  ' .. run_agent_usage('codex')
+  raw = raw:gsub('\n', '')
+  -- Strip spark bars (▁-█) and refresh icon (↻) plus surrounding spaces
+  raw = raw:gsub(' ?[\226][\150][\129-\136] ?', ' ')
+  raw = raw:gsub(' *[\226][\134][\187] *[%d]+[hdm] *[%d]*[hm]?', '')
+  raw = raw:gsub('  +', ' ')
+  local segs = parse_ansi_segments(raw)
+  local items = {}
+  for _, seg in ipairs(segs) do
+    if seg.text ~= '' then
+      local fg = seg.fg
+      if seg.text:match('^Codex') then fg = '#87d787' end
+      if fg then
+        table.insert(items, { Foreground = { Color = fg } })
+      else
+        table.insert(items, 'ResetAttributes')
+      end
+      table.insert(items, { Text = seg.text })
+    end
+  end
+  return wezterm.format(items)
+end
+
+wezterm.on('update-status', function(window, _pane)
+  local now = os.time()
+  if now - agent_usage_cache.ts >= AGENT_USAGE_REFRESH_SEC then
+    agent_usage_cache.text = build_status()
+    agent_usage_cache.ts = now
+  end
+  window:set_right_status(agent_usage_cache.text)
+end)
 
 return config
